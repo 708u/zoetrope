@@ -6,7 +6,11 @@
 //! (node/edge added) marks layout dirty; at sync end we run Sugiyama. Selection
 //! survives because node ids are stable and we never clear-and-re-add.
 
-use rataflow::{Edge, Flow, Handle, HandlePosition, Node, Reconnectable, Sugiyama, Theme};
+use std::collections::{HashMap, HashSet};
+
+use rataflow::{
+    Edge, Flow, Handle, HandlePosition, Node, Position, Reconnectable, Sugiyama, Theme,
+};
 use ratatui::style::Color;
 
 use super::session::{AgentInfo, AgentKind, AgentStatus, SessionModel};
@@ -94,6 +98,15 @@ const LOCAL_H_GAP: f64 = 4.0;
 /// Vertical gap below a parent for locally-placed children (world units).
 const LOCAL_V_GAP: f64 = 5.0;
 
+/// Default column count of the wrapped layout; `0` selects Sugiyama.
+pub const DEFAULT_WRAP_COLUMNS: usize = 4;
+/// Gap between columns of a wrapped grid (world units). Even, so the trunk
+/// down the middle of a gap lands on a whole cell.
+pub const WRAP_H_GAP: f64 = 4.0;
+/// Gap above each row of a wrapped grid (world units): room for the chip stack
+/// under the cards above (up to three rows) plus the bus line feeding the row.
+pub const WRAP_V_GAP: f64 = 6.0;
+
 /// Incrementally sync `flow` to `model`.
 ///
 /// For each agent in spawn order: mutate the existing node content in place, or
@@ -101,12 +114,17 @@ const LOCAL_V_GAP: f64 = 5.0;
 /// status. New nodes get LOCAL placement (below their parent, offset past
 /// siblings) so they land somewhere sensible even without a relayout.
 ///
-/// When `relayout` is true, any structural change ends with a full
-/// `Sugiyama::vertical()` pass (which overwrites the local placements). When
-/// false — Manual camera: the user owns the view — nothing existing moves;
-/// the caller tracks dirtiness and relayouts when the camera re-engages.
+/// `wrap` is the column count of the wrapped layout (`0` for Sugiyama). The
+/// wrapped layout appends a new child after its siblings, so it moves existing
+/// cards only when a row grows taller; any structural change therefore applies
+/// it in full, and the local placement never shows.
+///
+/// When `relayout` is true, any structural change ends with a full layout pass
+/// (which overwrites the local placements). When false and `wrap` is `0` —
+/// Manual camera: the user owns the view — nothing existing moves; the caller
+/// tracks dirtiness and relayouts when the camera re-engages.
 /// Returns `true` if structure changed.
-pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool) -> bool {
+pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool, wrap: usize) -> bool {
     let mut structural = false;
 
     // First pass: nodes (must exist before their edges).
@@ -207,8 +225,8 @@ pub fn sync(flow: &mut AgentFlow, model: &SessionModel, relayout: bool) -> bool 
         }
     }
 
-    if structural && relayout {
-        self::relayout(flow);
+    if structural && (relayout || wrap > 0) {
+        self::relayout(flow, wrap);
     }
     structural
 }
@@ -238,12 +256,170 @@ pub fn remove_agents(flow: &mut AgentFlow, agents: &[String]) {
     flow.retain_nodes(|n| !doomed.contains(n.id.as_str()));
 }
 
-/// Apply the Sugiyama vertical layout to `flow`.
+/// Lay out `flow`: the wrapped grid with `wrap` columns, or the Sugiyama
+/// vertical layout when `wrap` is `0`.
 ///
 /// Split out so it can be called explicitly and unit-tested independently of
 /// the per-agent diffing in [`sync`].
-pub fn relayout(flow: &mut AgentFlow) {
-    flow.apply_layout(Sugiyama::vertical());
+pub fn relayout(flow: &mut AgentFlow, wrap: usize) {
+    if wrap == 0 {
+        flow.apply_layout(Sugiyama::vertical());
+        let ids: Vec<String> = flow.edges().iter().map(|e| e.id.clone()).collect();
+        for id in ids {
+            if let Some(content) = flow.edge_content_mut(&id) {
+                content.trunk_x = None;
+            }
+        }
+        return;
+    }
+    let layout = WrappedLayout::compute(flow, wrap);
+    flow.set_node_positions(layout.positions.iter().map(|(id, p)| (id.as_str(), *p)));
+    let edges: Vec<(String, String)> = flow
+        .edges()
+        .iter()
+        .map(|e| (e.id.clone(), e.target.clone()))
+        .collect();
+    for (edge, target) in edges {
+        if let Some(content) = flow.edge_content_mut(&edge) {
+            content.trunk_x = layout.trunks.get(&target).copied();
+        }
+    }
+}
+
+/// Positions from the wrapped layout.
+///
+/// Each card sits at the top-left of its subtree's block, and its children fill
+/// a grid of at most `cols` columns below it in spawn order, so a new child
+/// lands after its siblings and the cards before it keep their place. A child
+/// with children of its own takes one grid cell sized to its whole subtree;
+/// each column is as wide as its widest cell and each row as tall as its
+/// tallest, which keeps the column gaps aligned from row to row so the trunks
+/// running down them never cross a card.
+#[derive(Debug, Default)]
+struct WrappedLayout {
+    /// Top-left corner of every card.
+    positions: HashMap<String, Position>,
+    /// Trunk x for each child below the first row of its parent's grid, keyed
+    /// by the child: the middle of the gap left of the child's column.
+    trunks: HashMap<String, f64>,
+}
+
+impl WrappedLayout {
+    fn compute(flow: &AgentFlow, cols: usize) -> Self {
+        let dims: HashMap<&str, (f64, f64)> = flow
+            .nodes()
+            .map(|n| (n.id.as_str(), (n.width, n.height)))
+            .collect();
+        // Edges are added in spawn order, so each parent's children list keeps
+        // the order its agents were spawned in.
+        let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut has_parent: HashSet<&str> = HashSet::new();
+        for e in flow.edges() {
+            let (source, target) = (e.source.as_str(), e.target.as_str());
+            if dims.contains_key(source) && dims.contains_key(target) {
+                children.entry(source).or_default().push(target);
+                has_parent.insert(target);
+            }
+        }
+        let mut builder = Builder {
+            cols: cols.max(1),
+            dims,
+            children,
+            sizes: HashMap::new(),
+            out: Self::default(),
+        };
+        // Roots side by side, separated by a double gap so their trunks stay
+        // apart.
+        let roots: Vec<&str> = flow
+            .nodes()
+            .map(|n| n.id.as_str())
+            .filter(|id| !has_parent.contains(id))
+            .collect();
+        let mut x = 0.0;
+        for root in roots {
+            let (w, _) = builder.measure(root);
+            builder.place(root, x, 0.0);
+            x += w + WRAP_H_GAP * 2.0;
+        }
+        builder.out
+    }
+}
+
+struct Builder<'a> {
+    cols: usize,
+    dims: HashMap<&'a str, (f64, f64)>,
+    children: HashMap<&'a str, Vec<&'a str>>,
+    /// Memoized subtree block sizes.
+    sizes: HashMap<&'a str, (f64, f64)>,
+    out: WrappedLayout,
+}
+
+impl<'a> Builder<'a> {
+    fn kids(&self, id: &str) -> Vec<&'a str> {
+        self.children.get(id).cloned().unwrap_or_default()
+    }
+
+    /// Column widths and row heights of the grid holding `kids`.
+    fn grid(&mut self, kids: &[&'a str]) -> (Vec<f64>, Vec<f64>) {
+        let cols = self.cols.min(kids.len());
+        let mut col_w = vec![0.0_f64; cols];
+        let mut row_h = vec![0.0_f64; kids.len().div_ceil(cols)];
+        for (i, kid) in kids.iter().enumerate() {
+            let (w, h) = self.measure(kid);
+            col_w[i % cols] = col_w[i % cols].max(w);
+            row_h[i / cols] = row_h[i / cols].max(h);
+        }
+        (col_w, row_h)
+    }
+
+    /// Width and height of the block holding `id` and its subtree.
+    fn measure(&mut self, id: &'a str) -> (f64, f64) {
+        if let Some(&size) = self.sizes.get(id) {
+            return size;
+        }
+        let (w, h) = self.dims[id];
+        let kids = self.kids(id);
+        let size = if kids.is_empty() {
+            (w, h)
+        } else {
+            let (col_w, row_h) = self.grid(&kids);
+            let grid_w = col_w.iter().sum::<f64>() + WRAP_H_GAP * (col_w.len() - 1) as f64;
+            let grid_h = row_h.iter().map(|h| h + WRAP_V_GAP).sum::<f64>();
+            (w.max(grid_w), h + grid_h)
+        };
+        self.sizes.insert(id, size);
+        size
+    }
+
+    fn place(&mut self, id: &'a str, left: f64, top: f64) {
+        self.out
+            .positions
+            .insert(id.to_string(), Position::new(left, top));
+        let kids = self.kids(id);
+        if kids.is_empty() {
+            return;
+        }
+        let (_, h) = self.dims[id];
+        let (col_w, row_h) = self.grid(&kids);
+        let mut col_x = Vec::with_capacity(col_w.len());
+        let mut x = left;
+        for w in &col_w {
+            col_x.push(x);
+            x += w + WRAP_H_GAP;
+        }
+        let mut y = top + h + WRAP_V_GAP;
+        for (r, row) in kids.chunks(col_w.len()).enumerate() {
+            for (c, kid) in row.iter().enumerate() {
+                if r > 0 {
+                    self.out
+                        .trunks
+                        .insert(kid.to_string(), col_x[c] - WRAP_H_GAP / 2.0);
+                }
+                self.place(kid, col_x[c], y);
+            }
+            y += row_h[r] + WRAP_V_GAP;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -281,7 +457,7 @@ mod tests {
     fn sync_creates_nodes_and_edge() {
         let model = model_with_subagent();
         let mut flow = new_flow();
-        let structural = sync(&mut flow, &model, true);
+        let structural = sync(&mut flow, &model, true, 0);
         assert!(structural);
         assert!(flow.node_content_mut("main").is_some());
         assert!(flow.node_content_mut("abc123").is_some());
@@ -293,13 +469,13 @@ mod tests {
     fn sync_idempotent() {
         let model = model_with_subagent();
         let mut flow = new_flow();
-        let first = sync(&mut flow, &model, true);
+        let first = sync(&mut flow, &model, true, 0);
         assert!(first);
         let node_count = flow.nodes().count();
         let edge_count = flow.edges().len();
 
         // Applying the same model again adds nothing structural.
-        let second = sync(&mut flow, &model, true);
+        let second = sync(&mut flow, &model, true, 0);
         assert!(!second);
         assert_eq!(flow.nodes().count(), node_count);
         assert_eq!(flow.edges().len(), edge_count);
@@ -309,7 +485,7 @@ mod tests {
     fn sync_preserves_selection() {
         let model = model_with_subagent();
         let mut flow = new_flow();
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, 0);
         flow.select_node("abc123");
         assert_eq!(
             flow.selected_nodes().next().map(|n| n.id.clone()),
@@ -321,7 +497,7 @@ mod tests {
         if let Some(a) = model2.agents.get_mut("abc123") {
             a.output_tokens += 100;
         }
-        sync(&mut flow, &model2, true);
+        sync(&mut flow, &model2, true, 0);
         assert_eq!(
             flow.selected_nodes().next().map(|n| n.id.clone()),
             Some("abc123".to_string())
@@ -332,7 +508,7 @@ mod tests {
     fn edge_animation_follows_status() {
         let mut model = model_with_subagent();
         let mut flow = new_flow();
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, 0);
         // Running subagent -> animated edge.
         let edge_id = edge_id("abc123");
         let animated = flow
@@ -349,7 +525,7 @@ mod tests {
         if let Some(a) = model.agents.get_mut("abc123") {
             a.status = AgentStatus::Done;
         }
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, 0);
         let animated = flow
             .edges()
             .iter()
@@ -365,7 +541,7 @@ mod tests {
 
         let model = model_with_subagent();
         let mut flow = new_flow();
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, 0);
 
         for node in flow.nodes() {
             assert!(node.selectable, "nodes stay selectable (detail panel)");
@@ -385,7 +561,7 @@ mod tests {
         let mut model = model_with_subagent();
         let mut flow = new_flow();
         // Initial layout (camera engaged).
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, 0);
         let main_pos = flow.node("main").unwrap().position;
         let first_sub = flow.node("abc123").unwrap().position;
 
@@ -397,7 +573,7 @@ mod tests {
             stopped_by_user: None,
         };
         model.apply_meta("def456", None, &meta2);
-        let structural = sync(&mut flow, &model, false);
+        let structural = sync(&mut flow, &model, false, 0);
         assert!(structural);
 
         // Nothing existing moved...
@@ -417,7 +593,7 @@ mod tests {
 
         let model = model_with_subagent();
         let mut flow = new_flow();
-        sync(&mut flow, &model, true);
+        sync(&mut flow, &model, true, 0);
         flow.request_fit_view();
 
         let area = Rect::new(0, 0, 100, 30);
@@ -439,5 +615,101 @@ mod tests {
             text.contains("guide"),
             "subagent card title missing from render:\n{text}"
         );
+    }
+
+    /// `model_with_subagent` plus `extra` more direct subagents.
+    fn model_with_subagents(extra: usize) -> (SessionModel, Vec<String>) {
+        let mut model = model_with_subagent();
+        let mut ids = vec!["abc123".to_string()];
+        for i in 0..extra {
+            let id = format!("sub{i}");
+            let meta = SubagentMeta {
+                agent_type: Some("guide".into()),
+                description: None,
+                tool_use_id: Some(format!("ag-extra{i}")),
+                stopped_by_user: None,
+            };
+            model.apply_meta(&id, None, &meta);
+            ids.push(id);
+        }
+        (model, ids)
+    }
+
+    fn rect(flow: &AgentFlow, id: &str) -> (f64, f64, f64, f64) {
+        let n = flow.node(id).unwrap();
+        (n.position.x, n.position.y, n.width, n.height)
+    }
+
+    #[test]
+    fn wrapped_layout_breaks_rows_after_wrap_columns() {
+        let (model, ids) = model_with_subagents(5);
+        let mut flow = new_flow();
+        sync(&mut flow, &model, false, 4);
+
+        let first_row: Vec<_> = ids[..4].iter().map(|id| rect(&flow, id)).collect();
+        let second_row: Vec<_> = ids[4..].iter().map(|id| rect(&flow, id)).collect();
+        assert!(first_row.iter().all(|r| r.1 == first_row[0].1));
+        assert!(second_row.iter().all(|r| r.1 == second_row[0].1));
+        assert!(
+            second_row[0].1 > first_row[0].1 + first_row[0].3,
+            "the fifth child wraps below the first row"
+        );
+        // Columns line up from row to row.
+        assert_eq!(second_row[0].0, first_row[0].0);
+        assert_eq!(second_row[1].0, first_row[1].0);
+
+        // Only the wrapped row is routed over a trunk.
+        for (i, id) in ids.iter().enumerate() {
+            let trunk = flow.edge_content_mut(&edge_id(id)).unwrap().trunk_x;
+            assert_eq!(trunk.is_some(), i >= 4, "trunk for child {i}");
+        }
+    }
+
+    #[test]
+    fn wrapped_layout_cards_never_overlap() {
+        let (model, ids) = model_with_subagents(9);
+        let mut flow = new_flow();
+        sync(&mut flow, &model, false, 3);
+        let mut all = ids.clone();
+        all.push("main".into());
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                let (ax, ay, aw, ah) = rect(&flow, a);
+                let (bx, by, bw, bh) = rect(&flow, b);
+                let apart = ax + aw <= bx || bx + bw <= ax || ay + ah <= by || by + bh <= ay;
+                assert!(apart, "{a} overlaps {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_layout_keeps_existing_cards_when_a_sibling_arrives() {
+        let (model, ids) = model_with_subagents(4);
+        let mut flow = new_flow();
+        sync(&mut flow, &model, false, 4);
+        let before: Vec<_> = ids.iter().map(|id| rect(&flow, id)).collect();
+
+        let (model, ids) = model_with_subagents(6);
+        sync(&mut flow, &model, false, 4);
+        for (id, was) in ids.iter().zip(&before) {
+            assert_eq!(rect(&flow, id), *was, "{id} moved");
+        }
+    }
+
+    #[test]
+    fn wrap_zero_keeps_sugiyama_and_plain_edges() {
+        let (model, ids) = model_with_subagents(5);
+        let mut flow = new_flow();
+        sync(&mut flow, &model, true, 0);
+        let y = rect(&flow, &ids[0]).1;
+        assert!(ids.iter().all(|id| rect(&flow, id).1 == y), "one rank");
+        for id in &ids {
+            assert!(
+                flow.edge_content_mut(&edge_id(id))
+                    .unwrap()
+                    .trunk_x
+                    .is_none()
+            );
+        }
     }
 }

@@ -9,6 +9,7 @@
 //! zoe <dir>                 follow another project's live session
 //! zoe <file> --follow       follow a file's live edge instead of replaying
 //! zoe <file> --speed N      playback speed multiplier (default 8.0)
+//! zoe --wrap N              wrap siblings after N columns (0 = no wrap, default 4)
 //! zoe --provider <name> ... force the transcript format instead of detecting it
 //! zoe inspect <file|id|dir> headless: print the session tree + info
 //! ```
@@ -44,6 +45,8 @@ pub enum Cli {
         follow: bool,
         speed: f64,
         provider: Option<Provider>,
+        /// Column count of the wrapped layout; `0` selects Sugiyama.
+        wrap: usize,
     },
     /// Headless: parse and print the session tree + info; no TUI. The target
     /// resolves like `View`'s: a file, a session id, or a project directory.
@@ -66,6 +69,7 @@ USAGE:
     zoe <dir>               follow another project's live session
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
+    zoe --wrap N            wrap siblings after N columns (0 = no wrap, default 4)
     zoe --provider <name>   force the format (claude, codex) instead of detecting it
     zoe inspect <file|id>   headless: print the session tree + info
     zoe --version           print the version and exit
@@ -114,6 +118,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     let mut follow = false;
     let mut speed = DEFAULT_REPLAY_SPEED;
     let mut provider = None;
+    let mut wrap = zoetrope::state::DEFAULT_WRAP_COLUMNS;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -138,6 +143,14 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
                     bail!("--speed must be a positive number, got {v:?}");
                 }
             }
+            "--wrap" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--wrap requires a number\n\n{USAGE}"))?;
+                wrap = v
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid --wrap value: {v:?}"))?;
+            }
             "--provider" => provider = provider_flag(&mut args)?,
             other if other.starts_with('-') => {
                 bail!("unknown flag {other:?}\n\n{USAGE}");
@@ -156,6 +169,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
         follow,
         speed,
         provider,
+        wrap,
     })
 }
 
@@ -233,6 +247,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
         follow,
         speed,
         provider,
+        wrap,
     } = cli
     else {
         unreachable!("inspect handled in main");
@@ -278,7 +293,8 @@ async fn run_tui(cli: Cli) -> Result<()> {
         }
     });
 
-    let app = App::new(session_id, mode);
+    let mut app = App::new(session_id, mode);
+    app.wrap = wrap;
     tui::run(app, tail_tx, ui_rx).await
 }
 
@@ -384,6 +400,7 @@ mod tests {
                 follow,
                 speed,
                 provider,
+                ..
             } => {
                 assert_eq!(p, "s.jsonl");
                 assert_eq!(speed, 4.0);
@@ -416,6 +433,19 @@ mod tests {
         assert!(cli(&["s.jsonl", "--speed"]).is_err());
         assert!(cli(&["s.jsonl", "--provider", "gemini"]).is_err());
         assert!(cli(&["s.jsonl", "--provider"]).is_err());
+    }
+
+    #[test]
+    fn wrap_flag_defaults_and_parses() {
+        let wrap_of = |args: &[&str]| match cli(args).unwrap() {
+            Cli::View { wrap, .. } => wrap,
+            other => panic!("got {other:?}"),
+        };
+        assert_eq!(wrap_of(&["s.jsonl"]), zoetrope::state::DEFAULT_WRAP_COLUMNS);
+        assert_eq!(wrap_of(&["s.jsonl", "--wrap", "6"]), 6);
+        assert_eq!(wrap_of(&["--wrap", "0"]), 0);
+        assert!(cli(&["--wrap", "-1"]).is_err());
+        assert!(cli(&["--wrap"]).is_err());
     }
 
     #[test]

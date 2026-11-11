@@ -16,7 +16,7 @@ pub(crate) mod timeline;
 
 // `App`'s public fields, nameable from outside without exposing the module
 // layout they live in.
-pub use self::graph::AgentFlow;
+pub use self::graph::{AgentFlow, DEFAULT_WRAP_COLUMNS};
 pub use self::info::SessionInfo;
 pub use self::timeline::Timeline;
 pub use crate::ui::chips::ChipTray;
@@ -176,10 +176,14 @@ pub struct App {
     pub chips: ChipTray,
     /// Whether the help overlay is shown (`?` toggles, `esc` closes).
     pub show_help: bool,
-    /// Layout deferred while the camera is Manual: structural changes use
-    /// local placement only (nothing existing moves under the user); the full
-    /// Sugiyama runs when the camera re-engages (`o`/`f`).
+    /// Layout deferred while the camera is Manual: with Sugiyama (`wrap` 0)
+    /// structural changes use local placement only (nothing existing moves
+    /// under the user); the full Sugiyama runs when the camera re-engages
+    /// (`o`/`f`). The wrapped layout ignores it: `graph::sync` applies that
+    /// layout on every structural change.
     pub layout_dirty: bool,
+    /// Column count of the wrapped layout; `0` selects Sugiyama.
+    pub wrap: usize,
     /// Most recent tailer error, surfaced in the status bar (`None` = healthy).
     pub last_error: Option<String>,
     /// True once the event loop should terminate.
@@ -244,6 +248,7 @@ impl App {
             chips: ChipTray::default(),
             show_help: false,
             layout_dirty: false,
+            wrap: graph::DEFAULT_WRAP_COLUMNS,
             last_error: None,
             should_quit: false,
             camera_glide: None,
@@ -782,19 +787,21 @@ impl App {
         // fanned past siblings) and nothing existing moves until the user asks
         // to tidy (`r`, or re-engaging the camera with `o`/`f`). `layout_dirty`
         // tracks that there is un-applied growth for the on-demand path.
-        let structural = graph::sync(&mut self.flow, &self.session, false);
+        // The wrapped layout is the exception: it appends new cards after their
+        // siblings, so `graph::sync` applies it on every structural change.
+        let structural = graph::sync(&mut self.flow, &self.session, false, self.wrap);
         if structural {
             self.layout_dirty = true;
         }
         structural
     }
 
-    /// Tidy the graph on demand (`r`): run Sugiyama now and reframe for the
+    /// Tidy the graph on demand (`r`): run the layout now and reframe for the
     /// current camera. Layout is never automatic (see `resync`),
     /// so this is the user's explicit "rearrange". Forces a pass even when not
     /// `layout_dirty`, so it also re-tidies after manual node dragging.
     pub fn relayout_now(&mut self) {
-        graph::relayout(&mut self.flow);
+        graph::relayout(&mut self.flow, self.wrap);
         self.layout_dirty = false;
         match self.camera {
             Camera::Overview => self.flow.request_fit_view(),
@@ -822,7 +829,7 @@ impl App {
             self.session.recompute_group_status();
             // Status flips never change topology, so this is a content-only sync;
             // layout stays user-driven (no auto-relayout — see `resync`).
-            graph::sync(&mut self.flow, &self.session, false);
+            graph::sync(&mut self.flow, &self.session, false, self.wrap);
         }
         if self.camera == Camera::Follow {
             self.track_activity();
